@@ -1,0 +1,12 @@
+# Build output
+/build/
+
+# Local configuration and logs
+/Jellyfin68K.cfg
+/shared/
+*.log
+
+# Editor/OS noise
+*~
+.DS_Store
+__pycache__/
