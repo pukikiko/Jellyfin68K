@@ -1,10 +1,17 @@
 # Build output
 /build/
 
-# Local configuration and logs
-/Jellyfin68K.cfg
-/shared/
-*.log
+# Basilisk II working state (system disk copy, app disk copy, prefs)
+/.state/
+
+# Local Mac ROM and system software: never commit these
+/images/*
+!/images/README.md
+
+# The Mac's shared "Unix" volume contains runtime files (config, logs,
+# downloaded MP3s, decoded AIFFs).  Keep only its README in git.
+/shared/*
+!/shared/README.txt
 
 # Editor/OS noise
 *~

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cross-compile Jellyfin 68K with Retro68.
+# Build the sample application with Retro68.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,7 +17,7 @@ if [[ -n "${RETRO68_TOOLCHAIN:-}" ]]; then
         exit 1
     }
 
-    cmake -S . -B "$BUILD_DIR" \
+    cmake -S app -B "$BUILD_DIR" \
         -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
         -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE"
     cmake --build "$BUILD_DIR" --parallel
@@ -45,7 +45,7 @@ else
         "$IMAGE" \
         bash -lc '
             set -euo pipefail
-            cmake -S . -B build \
+            cmake -S app -B build \
                 -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
                 -DCMAKE_TOOLCHAIN_FILE=/Retro68-build/toolchain/m68k-apple-macos/cmake/retro68.toolchain.cmake
             cmake --build build --parallel
@@ -53,6 +53,8 @@ else
 fi
 
 echo
-echo "Build output:"
+echo "Primary application:"
 ls -lh "$BUILD_DIR"/Jellyfin68K.dsk "$BUILD_DIR"/Jellyfin68K.bin \
     "$BUILD_DIR"/.rsrc/Jellyfin68K.APPL 2>/dev/null || true
+echo
+echo "Diagnostics: NetProbe, NetTest, MP3Test, VolDump, LaunchJF, Hello68K"

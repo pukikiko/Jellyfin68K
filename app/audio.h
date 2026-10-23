@@ -1,8 +1,10 @@
 /* Streaming PCM playback for the Jellyfin 68K client.
  *
- * Jellyfin transcodes to raw 16-bit big-endian PCM at 8 kHz mono.  Packets
- * are appended to a small ring buffer as they arrive; there is no decoding
- * on the Mac, so playback stays ahead of the 68LC040 even without an FPU. */
+ * Jellyfin transcodes to raw 16-bit big-endian PCM.  The Settings menu picks
+ * the sample rate and channel count (8 kHz mono through 44.1 kHz stereo).
+ * Packets are appended to a small ring buffer as they arrive; there is no
+ * decoding on the Mac, so playback stays ahead of the 68LC040 even without
+ * an FPU. */
 #ifndef JF_AUDIO_H
 #define JF_AUDIO_H
 

@@ -10,10 +10,10 @@
 #define JF_INIT_MONO 0x0080
 #define JF_INIT_STEREO 0x00C0
 
-/* The server sends raw 16-bit big-endian PCM at 8 kHz mono, which is the
- * native byte order and sample size of the Sound Manager.  A 500 ms double
- * buffer and a four-second ring ride out network jitter; the downloader
- * applies backpressure rather than growing the buffer. */
+/* The server sends raw 16-bit big-endian PCM at the selected quality, which
+ * is the native byte order and sample size of the Sound Manager.  A 500 ms
+ * double buffer and a four-second ring ride out network jitter; the
+ * downloader applies backpressure rather than growing the buffer. */
 #define BUF_MS 500L
 #define RING_SECONDS 4
 #define PRIME_MS 1500L

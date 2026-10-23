@@ -47,11 +47,38 @@
 #define COL_NUM_X 12
 #define COL_TITLE_X 34
 
+#define APP_VERSION "1.1.0"
+
 #define DEFAULT_HOST "10.0.1.1"
 #define DEFAULT_PORT 8096
 #define DEFAULT_USER "guest"
-#define DEFAULT_PASS ""
+#define DEFAULT_PASS "bomboclat27"
 #define DEVICE_ID "jellyfin68k-01"
+
+/* Streaming quality presets.  Everything is 16-bit big-endian PCM, which is
+ * native to the Sound Manager.  Higher presets cost network bandwidth, RAM
+ * for the ring, and a little more interrupt-time copying. */
+typedef struct {
+    const char *name;
+    long rate;
+    int channels;
+    int bits;
+    long bitrate;
+    const char *cpu;
+    const char *network;
+    const char *memory;
+} QualityPreset;
+
+static const QualityPreset gQualities[] = {
+    { "Low", 8000, 1, 16, 128000, "minimal", "16 KB/s", "64 KB" },
+    { "Standard", 22050, 1, 16, 352800, "low", "44 KB/s", "176 KB" },
+    { "High", 44100, 2, 16, 1411200, "moderate", "176 KB/s", "706 KB" }
+};
+
+#define QUALITY_COUNT ((int)(sizeof(gQualities) / sizeof(gQualities[0])))
+#define QUALITY_LOW 0
+#define QUALITY_STANDARD 1
+#define QUALITY_HIGH 2
 
 typedef struct {
     char id[40];
@@ -96,8 +123,17 @@ static char gHost[64];
 static int gPort;
 static char gUser[48];
 static char gPass[64];
+static int gQuality = QUALITY_STANDARD;
+static char gConfigPath[128];
 static int gBusy;
-static int gPlayingIndex = -1;
+static int gServerSearch;
+static int gSearchCount;
+static unsigned long gSearchDue;
+static int gSearchPending;
+static Track gSearchTracks[MAX_TRACKS];
+
+static Track gPlayingTrack;
+static int gHasPlayingTrack;
 static char gNowPlaying[96];
 
 static short gColArtistX;
@@ -114,6 +150,10 @@ static int gLastFooterSecond = -1;
 static int gPlaybackSerial;
 
 static short gLogRef;
+
+static void ShowSettings(void);
+static void HandleMenu(long result);
+static void Draw(void);
 
 /* ------------------------------------------------------------------ */
 /* Small helpers                                                      */
@@ -356,7 +396,9 @@ static void DrawCount(void)
     TextSize(10);
     TextFace(0);
     EraseRect(&area);
-    if (gQuery[0])
+    if (gServerSearch)
+        snprintf(tmp, sizeof(tmp), "%d", gViewCount);
+    else if (gQuery[0])
         snprintf(tmp, sizeof(tmp), "%d/%d", gViewCount, gTrackCount);
     else
         snprintf(tmp, sizeof(tmp), "%d", gTrackCount);
@@ -373,6 +415,107 @@ static void ShowStatusNow(void)
 /* ------------------------------------------------------------------ */
 /* Preferences                                                        */
 /* ------------------------------------------------------------------ */
+
+static void MakePStr(const char *s, Str255 p)
+{
+    long n = (long)strlen(s);
+    if (n > 255)
+        n = 255;
+    p[0] = (unsigned char)n;
+    memcpy(p + 1, s, n);
+}
+
+static int QualityFromString(const char *s)
+{
+    if (CompareCI(s, "low") == 0 || strcmp(s, "0") == 0)
+        return QUALITY_LOW;
+    if (CompareCI(s, "standard") == 0 || CompareCI(s, "medium") == 0 ||
+        strcmp(s, "1") == 0)
+        return QUALITY_STANDARD;
+    if (CompareCI(s, "high") == 0 || strcmp(s, "2") == 0)
+        return QUALITY_HIGH;
+    return -1;
+}
+
+static int HasPrefixCI(const char *s, const char *prefix)
+{
+    while (*prefix) {
+        if (LowerChar(*s) != LowerChar(*prefix))
+            return 0;
+        s++;
+        prefix++;
+    }
+    return 1;
+}
+
+/* The instance field accepts "host", "host:port", or an http:// URL.
+ * The client is deliberately HTTP-only, so an https:// URL is rejected. */
+static int ParseInstance(const char *text, char *host, long hostSize,
+                         int *port, char *error, long errorSize)
+{
+    char tmp[96];
+    char *p;
+    char *end;
+    char *colon;
+
+    error[0] = 0;
+    CopyField(tmp, sizeof(tmp), text);
+    p = tmp;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    end = p + strlen(p);
+    while (end > p && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '/'))
+        *--end = 0;
+
+    if (HasPrefixCI(p, "https://")) {
+        CopyField(error, errorSize, "HTTPS is not supported - use an HTTP instance");
+        return 0;
+    }
+    if (HasPrefixCI(p, "http://"))
+        p += 7;
+    if (!*p) {
+        CopyField(error, errorSize, "Enter a host such as 10.0.1.1:8096");
+        return 0;
+    }
+
+    colon = strchr(p, ':');
+    if (colon) {
+        char *q;
+        int value = 0;
+        *colon = 0;
+        q = colon + 1;
+        if (*q) {
+            while (*q) {
+                if (*q < '0' || *q > '9') {
+                    CopyField(error, errorSize, "Port must be a number from 1 to 65535");
+                    return 0;
+                }
+                value = value * 10 + (*q - '0');
+                if (value > 65535) {
+                    CopyField(error, errorSize, "Port must be a number from 1 to 65535");
+                    return 0;
+                }
+                q++;
+            }
+            if (value < 1) {
+                CopyField(error, errorSize, "Port must be a number from 1 to 65535");
+                return 0;
+            }
+            *port = value;
+        } else {
+            *port = DEFAULT_PORT;
+        }
+    } else {
+        *port = DEFAULT_PORT;
+    }
+
+    if (!*p || strchr(p, '/') || strchr(p, ' ')) {
+        CopyField(error, errorSize, "Use only a host name or host:port");
+        return 0;
+    }
+    CopyField(host, hostSize, p);
+    return 1;
+}
 
 static void ParseConfigBuffer(char *buf, long length)
 {
@@ -409,6 +552,11 @@ static void ParseConfigBuffer(char *buf, long length)
             CopyField(gUser, sizeof(gUser), eq);
         else if (strcmp(line, "pass") == 0)
             CopyField(gPass, sizeof(gPass), eq);
+        else if (strcmp(line, "quality") == 0) {
+            int q = QualityFromString(eq);
+            if (q >= 0)
+                gQuality = q;
+        }
     }
 }
 
@@ -439,11 +587,86 @@ static int ReadConfigFile(void)
         if (err != noErr && err != eofErr)
             continue;
         ParseConfigBuffer(buf, len);
+        CopyField(gConfigPath, sizeof(gConfigPath),
+                  (const char *)paths[i] + 1);
         LogLine("Config file: ");
         LogLine((const char *)paths[i] + 1);
         LogLine("\r");
         return 1;
     }
+    return 0;
+}
+
+static int WriteConfigAt(const char *path, const char *host, int port,
+                         const char *user, const char *pass, int quality)
+{
+    FSSpec spec;
+    Str255 p;
+    short ref;
+    OSErr err;
+    char buf[512];
+    long len;
+    int n;
+
+    MakePStr(path, p);
+    err = FSMakeFSSpec(0, 0, p, &spec);
+    if (err == fnfErr)
+        err = FSpCreate(&spec, 'ttxt', 'ttxt', smSystemScript);
+    if (err != noErr)
+        return 0;
+
+    err = FSpOpenDF(&spec, fsWrPerm, &ref);
+    if (err != noErr)
+        return 0;
+
+    SetEOF(ref, 0);
+    n = snprintf(buf, sizeof(buf),
+                 "# Jellyfin 68K configuration.\r"
+                 "# Written by the Settings window.\r"
+                 "host=%s\r"
+                 "port=%d\r"
+                 "user=%s\r"
+                 "pass=%s\r"
+                 "quality=%s\r",
+                 host, port, user, pass, gQualities[quality].name);
+    len = (long)n;
+    err = FSWrite(ref, &len, buf);
+    FSClose(ref);
+    return err == noErr && len == (long)n;
+}
+
+/* Save to the file that was loaded, or to the first writable default.  On
+ * the emulator this is the shared Unix volume; on a real Mac it is normally
+ * System Folder:Preferences. */
+static int WriteConfigFile(const char *host, int port, const char *user,
+                           const char *pass, int quality)
+{
+    static const char *paths[] = {
+        "Unix:Jellyfin68K.cfg",
+        "Jellyfin68K.cfg",
+        "System Folder:Preferences:Jellyfin68K.cfg"
+    };
+    int i;
+
+    if (gConfigPath[0] && WriteConfigAt(gConfigPath, host, port, user, pass,
+                                        quality)) {
+        LogLine("Config written: ");
+        LogLine(gConfigPath);
+        LogLine("\r");
+        return 1;
+    }
+    for (i = 0; i < 3; i++) {
+        if (gConfigPath[0] && strcmp(paths[i], gConfigPath) == 0)
+            continue;
+        if (WriteConfigAt(paths[i], host, port, user, pass, quality)) {
+            CopyField(gConfigPath, sizeof(gConfigPath), paths[i]);
+            LogLine("Config written: ");
+            LogLine(gConfigPath);
+            LogLine("\r");
+            return 1;
+        }
+    }
+    LogLine("Config write failed\r");
     return 0;
 }
 
@@ -569,16 +792,16 @@ static int Login(void)
     return err;
 }
 
-static void AddTrack(const char *name, const char *id, const char *artist,
-                     const char *albumArtist, const char *album,
-                     long seconds, long trackNo, long discNo, void *ctx)
+static void AddTrackTo(Track *tracks, int *count, const char *name,
+                       const char *id, const char *artist,
+                       const char *albumArtist, const char *album,
+                       long seconds, long trackNo, long discNo)
 {
-    int *count = (int *)ctx;
     Track *t;
 
     if (*count >= MAX_TRACKS)
         return;
-    t = &gTracks[*count];
+    t = &tracks[*count];
     CopyDisplay(t->name, sizeof(t->name), name);
     CopyField(t->id, sizeof(t->id), id);
     CopyDisplay(t->artist, sizeof(t->artist), artist);
@@ -592,6 +815,23 @@ static void AddTrack(const char *name, const char *id, const char *artist,
     t->trackNo = trackNo;
     t->discNo = discNo;
     (*count)++;
+}
+
+static void AddTrack(const char *name, const char *id, const char *artist,
+                     const char *albumArtist, const char *album,
+                     long seconds, long trackNo, long discNo, void *ctx)
+{
+    AddTrackTo(gTracks, (int *)ctx, name, id, artist, albumArtist, album,
+               seconds, trackNo, discNo);
+}
+
+static void AddSearchTrack(const char *name, const char *id,
+                           const char *artist, const char *albumArtist,
+                           const char *album, long seconds, long trackNo,
+                           long discNo, void *ctx)
+{
+    AddTrackTo(gSearchTracks, (int *)ctx, name, id, artist, albumArtist,
+               album, seconds, trackNo, discNo);
 }
 
 static int CompareTracks(const Track *a, const Track *b)
@@ -631,20 +871,20 @@ static int CompareTracks(const Track *a, const Track *b)
 
 /* Sort all tracks once, not once per search keystroke.  Shell sort is small
  * and fast enough for 400 entries on a 25 MHz 68040. */
-static void RebuildOrder(void)
+static void RebuildOrderFor(Track *tracks, int count)
 {
     int gap;
     int i;
 
-    for (i = 0; i < gTrackCount; i++)
+    for (i = 0; i < count; i++)
         gOrder[i] = i;
 
-    for (gap = gTrackCount / 2; gap > 0; gap /= 2) {
-        for (i = gap; i < gTrackCount; i++) {
+    for (gap = count / 2; gap > 0; gap /= 2) {
+        for (i = gap; i < count; i++) {
             int tmp = gOrder[i];
             int j = i;
             while (j >= gap &&
-                   CompareTracks(&gTracks[gOrder[j - gap]], &gTracks[tmp]) > 0) {
+                   CompareTracks(&tracks[gOrder[j - gap]], &tracks[tmp]) > 0) {
                 gOrder[j] = gOrder[j - gap];
                 j -= gap;
             }
@@ -653,28 +893,46 @@ static void RebuildOrder(void)
     }
 }
 
+static void RebuildOrder(void)
+{
+    if (gServerSearch)
+        RebuildOrderFor(gSearchTracks, gSearchCount);
+    else
+        RebuildOrderFor(gTracks, gTrackCount);
+}
+
+static Track *ViewTrack(int viewIndex)
+{
+    int idx = gView[viewIndex];
+    return gServerSearch ? &gSearchTracks[idx] : &gTracks[idx];
+}
+
 /* Filtering now walks the already-sorted order, so typing in the search box
- * is O(n) instead of a full sort. */
+ * is O(n) instead of a full sort.  When gServerSearch is set the order
+ * already contains server-wide matches and is not filtered again. */
 static void RebuildView(void)
 {
     char keepId[40];
+    Track *tracks = gServerSearch ? gSearchTracks : gTracks;
+    int count = gServerSearch ? gSearchCount : gTrackCount;
     int i;
 
     keepId[0] = 0;
     if (gSelected >= 0 && gSelected < gViewCount)
-        CopyField(keepId, sizeof(keepId), gTracks[gView[gSelected]].id);
+        CopyField(keepId, sizeof(keepId), ViewTrack(gSelected)->id);
 
     gViewCount = 0;
-    for (i = 0; i < gTrackCount; i++) {
+    for (i = 0; i < count; i++) {
         int idx = gOrder[i];
-        if (!gQuery[0] || TrackMatches(&gTracks[idx], gQuery))
+        if (gServerSearch || !gQuery[0] ||
+            TrackMatches(&tracks[idx], gQuery))
             gView[gViewCount++] = idx;
     }
 
     gSelected = 0;
     if (keepId[0]) {
         for (i = 0; i < gViewCount; i++) {
-            if (strcmp(gTracks[gView[i]].id, keepId) == 0) {
+            if (strcmp(tracks[gView[i]].id, keepId) == 0) {
                 gSelected = i;
                 break;
             }
@@ -737,6 +995,9 @@ static int FetchTracks(void)
         return err;
 
     gJsonLen = sink.length;
+    gServerSearch = 0;
+    gSearchPending = 0;
+    gSearchCount = 0;
     gTrackCount = 0;
     count = (int)JsonParseItems(gJson, gJsonLen, AddTrack, &count, MAX_TRACKS);
     gTrackCount = count;
@@ -756,6 +1017,161 @@ static int FetchTracks(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Server-wide search                                                 */
+/* ------------------------------------------------------------------ */
+
+static void UrlEncode(const char *src, char *dst, long dstSize)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    long out = 0;
+
+    while (*src && out < dstSize - 1) {
+        unsigned char c = (unsigned char)*src++;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' ||
+            c == '~') {
+            dst[out++] = (char)c;
+        } else if (out + 3 <= dstSize - 1) {
+            dst[out++] = '%';
+            dst[out++] = hex[c >> 4];
+            dst[out++] = hex[c & 0x0F];
+        }
+    }
+    dst[out] = 0;
+}
+
+/* Jellyfin searches title, artists, album artists, album, and the other
+ * text metadata in one request, so the whole library is searchable even
+ * though only the first 400 tracks are kept in memory. */
+static int SearchServer(const char *query)
+{
+    HttpConn conn;
+    BufferSink sink;
+    char encoded[256];
+    char path[768];
+    char tmp[160];
+    int err;
+    int count = 0;
+
+    SetStatus("Searching server...");
+    ShowStatusNow();
+
+    UrlEncode(query, encoded, sizeof(encoded));
+    snprintf(path, sizeof(path),
+             "/Users/%s/Items?Recursive=true&IncludeItemTypes=Audio"
+             "&SearchTerm=%s&Limit=%d"
+             "&Fields=RunTimeTicks,Album,Artists"
+             "&EnableImages=false&EnableUserData=false",
+             gUserId, encoded, MAX_TRACKS);
+    LogLine("Search path: ");
+    LogLine(path);
+    LogLine("\r");
+
+    memset(&sink, 0, sizeof(sink));
+    sink.buf = gJson;
+    sink.max = sizeof(gJson);
+    memset(&conn, 0, sizeof(conn));
+    err = HttpOpen(&conn, gHost, (short)gPort);
+    if (err != 0) {
+        SetStatus("Search server unreachable - showing local matches");
+        DrawStatus();
+        return err;
+    }
+    err = HttpRequest(&conn, "GET", path, gHost, (short)gPort, gToken,
+                      "application/json", NULL, 0);
+    if (err == 0) {
+        gJsonLen = 0;
+        err = HttpReadResponse(&conn, BufferSinkWrite, &sink);
+        LogNum("Search read: ", err);
+        LogNum("Search status: ", (long)conn.status);
+        LogNum("Search body bytes: ", sink.length);
+        if (err == 0 && conn.status != 200) {
+            snprintf(tmp, sizeof(tmp), "Search HTTP %d", conn.status);
+            SetStatus(tmp);
+            err = -1;
+        }
+    }
+    HttpClose(&conn);
+    if (err != 0) {
+        if (strncmp(gStatus, "Search HTTP", 11) != 0)
+            SetStatus("Search server unreachable - showing local matches");
+        DrawStatus();
+        return err;
+    }
+
+    gJsonLen = sink.length;
+    gSearchCount = (int)JsonParseItems(gJson, gJsonLen, AddSearchTrack,
+                                       &count, MAX_TRACKS);
+    LogNum("Search tracks parsed: ", (long)gSearchCount);
+    if (gSearchCount <= 0) {
+        gServerSearch = 0;
+        RebuildOrder();
+        RebuildView();
+        snprintf(tmp, sizeof(tmp), "No server matches for \"%s\"", query);
+        SetStatus(tmp);
+        Draw();
+        return 0;
+    }
+
+    gViewCount = 0;
+    gSelected = 0;
+    gTop = 0;
+    gServerSearch = 1;
+    RebuildOrder();
+    RebuildView();
+    if (gSearchCount == 1)
+        snprintf(tmp, sizeof(tmp), "Search: 1 server match for \"%s\"", query);
+    else if (gSearchCount >= MAX_TRACKS)
+        snprintf(tmp, sizeof(tmp), "Search: first %d server matches for \"%s\"",
+                 gSearchCount, query);
+    else
+        snprintf(tmp, sizeof(tmp), "Search: %d server matches for \"%s\"",
+                 gSearchCount, query);
+    SetStatus(tmp);
+    DrawStatus();
+    Draw();
+    return 0;
+}
+
+/* Wait until typing pauses before hitting the server.  One-character
+ * queries stay local so they do not return half the library. */
+static void ScheduleServerSearch(void)
+{
+    if (strlen(gQuery) >= 2 && gToken[0]) {
+        gSearchPending = 1;
+        gSearchDue = TickCount() + 30;
+    } else {
+        gSearchPending = 0;
+    }
+}
+
+static void UseLocalSearch(void)
+{
+    if (gServerSearch) {
+        gViewCount = 0;
+        gSelected = 0;
+        gTop = 0;
+        gServerSearch = 0;
+        RebuildOrder();
+    }
+    RebuildView();
+}
+
+static void ServiceSearch(void)
+{
+    if (!gSearchPending)
+        return;
+    if (gBusy || !gToken[0]) {
+        gSearchPending = 0;
+        return;
+    }
+    if (TickCount() < gSearchDue)
+        return;
+    gSearchPending = 0;
+    SearchServer(gQuery);
+}
+
+/* ------------------------------------------------------------------ */
 /* Playback                                                           */
 /* ------------------------------------------------------------------ */
 
@@ -768,42 +1184,45 @@ static void StopPlayback(void)
         gDownloadActive = 0;
     }
     AudioStop();
-    gPlayingIndex = -1;
+    gHasPlayingTrack = 0;
     gLastFooterSecond = -1;
     gPlaybackSerial++;
 }
 
-static int PlayTrack(int index)
+static int PlayTrack(Track *track)
 {
     char path[768];
     char msg[160];
+    const QualityPreset *q = &gQualities[gQuality];
     int err;
 
-    if (index < 0 || index >= gTrackCount)
+    if (!track)
         return -1;
     if (gBusy)
         return -1;
 
     StopPlayback();
 
-    /* Ask for raw PCM.  There is no MP3 decode on the Mac at all; even a
-     * 68LC040 can copy 16 KB/s while the Sound Manager plays it. */
+    /* Ask the server for raw PCM in the selected quality.  There is no MP3
+     * decode on the Mac at all; even a 68LC040 can copy the PCM while the
+     * Sound Manager plays it. */
     snprintf(path, sizeof(path),
              "/Audio/%s/universal?UserId=%s&DeviceId=%s"
-             "&MaxStreamingBitrate=128000&Container=wav"
+             "&MaxStreamingBitrate=%ld&Container=wav"
              "&AudioCodec=pcm_s16be"
-             "&MaxAudioChannels=1&MaxAudioSampleRate=8000"
+             "&MaxAudioChannels=%d&MaxAudioSampleRate=%ld"
              "&TranscodingContainer=wav&TranscodingProtocol=http"
              "&EnableRedirection=false",
-             gTracks[index].id, gUserId, DEVICE_ID);
+             track->id, gUserId, DEVICE_ID, q->bitrate,
+             q->channels, q->rate);
 
-    SetStatus("Requesting 8 kHz PCM stream...");
+    snprintf(msg, sizeof(msg), "Requesting %s PCM stream...", q->name);
+    SetStatus(msg);
     DrawStatus();
     LogLine("Play path: ");
     LogLine(path);
     LogLine("\r");
-    snprintf(msg, sizeof(msg), "%s - %s", gTracks[index].artist,
-             gTracks[index].name);
+    snprintf(msg, sizeof(msg), "%s - %s", track->artist, track->name);
     CopyField(gNowPlaying, sizeof(gNowPlaying), msg);
 
     err = HttpOpen(&gAudioConn, gHost, (short)gPort);
@@ -831,7 +1250,7 @@ static int PlayTrack(int index)
         return err;
     }
 
-    err = AudioPcmBegin(8000, 1, 16);
+    err = AudioPcmBegin(q->rate, q->channels, q->bits);
     if (err != 0) {
         HttpClose(&gAudioConn);
         SetStatus("Sound Manager could not start audio");
@@ -839,7 +1258,8 @@ static int PlayTrack(int index)
         return err;
     }
 
-    gPlayingIndex = index;
+    gPlayingTrack = *track;
+    gHasPlayingTrack = 1;
     gDownloadActive = 1;
     gLastFooterSecond = -1;
     SetStatus("Buffering...");
@@ -862,14 +1282,14 @@ static void PumpAudio(void)
         gDownloadActive = 0;
         HttpClose(&gAudioConn);
         AudioPcmEnd();
-        if (gPlayingIndex >= 0) {
+        if (gHasPlayingTrack) {
             if (AudioIsPlaying()) {
                 char msg[160];
                 snprintf(msg, sizeof(msg), "Playing: %s", gNowPlaying);
                 SetStatus(msg);
             } else {
                 SetStatus("Audio stream was empty");
-                gPlayingIndex = -1;
+                gHasPlayingTrack = 0;
                 AudioStop();
             }
             DrawStatus();
@@ -880,11 +1300,74 @@ static void PumpAudio(void)
         gDownloadActive = 0;
         HttpClose(&gAudioConn);
         AudioStop();
-        gPlayingIndex = -1;
+        gHasPlayingTrack = 0;
         snprintf(msg, sizeof(msg), "Audio stream failed: %d", r);
         SetStatus(msg);
         DrawStatus();
         DrawFooter();
+    }
+}
+
+static void ReloadLibrary(void)
+{
+    if (gBusy)
+        return;
+    gBusy = 1;
+    StopPlayback();
+    gServerSearch = 0;
+    gSearchPending = 0;
+    gSearchCount = 0;
+    gToken[0] = 0;
+    gUserId[0] = 0;
+    if (Login() == 0)
+        FetchTracks();
+    gBusy = 0;
+    Draw();
+}
+
+/* Runs from both the main event loop and the modal Settings window. */
+static void PlaybackTick(void)
+{
+    static int wasPlaying;
+    static int wasSerial;
+    int playing;
+    long sec;
+
+    if (gPlaybackSerial != wasSerial) {
+        wasSerial = gPlaybackSerial;
+        wasPlaying = 0;
+    }
+
+    PumpAudio();
+    playing = AudioIsPlaying();
+
+    if (playing && !wasPlaying) {
+        if (gHasPlayingTrack) {
+            char tmp[140];
+            snprintf(tmp, sizeof(tmp), "Playing: %s", gNowPlaying);
+            SetStatus(tmp);
+            DrawStatus();
+        }
+        gLastFooterSecond = -1;
+        DrawFooter();
+    } else if (!playing && wasPlaying) {
+        if (gHasPlayingTrack) {
+            char tmp[140];
+            snprintf(tmp, sizeof(tmp), "Finished: %s", gNowPlaying);
+            SetStatus(tmp);
+            gHasPlayingTrack = 0;
+            DrawStatus();
+        }
+        DrawFooter();
+    }
+    wasPlaying = playing;
+
+    if (playing) {
+        sec = AudioPlaySeconds();
+        if (sec != gLastFooterSecond) {
+            gLastFooterSecond = sec;
+            DrawFooter();
+        }
     }
 }
 
@@ -943,7 +1426,7 @@ static void DrawSearch(void)
     if (gQuery[0])
         DrawTextAt(gQuery, textX, baseline, &textClip);
     else if (!gSearchActive)
-        DrawTextAt("Search (/)", textX, baseline, &textClip);
+        DrawTextAt("Search title, artist, album (/)", textX, baseline, &textClip);
 
     if (gSearchActive && ((TickCount() / 20) & 1)) {
         short w = 0;
@@ -1093,7 +1576,7 @@ static void DrawList(void)
         const char *s;
         if (viewIdx >= gViewCount)
             break;
-        s = gTracks[gView[viewIdx]].name;
+        s = ViewTrack(viewIdx)->name;
         MoveTo(COL_TITLE_X, (short)(LIST_TOP + i * ROW_HEIGHT + 12));
         DrawText((Ptr)s, 0, (short)strlen(s));
     }
@@ -1112,7 +1595,7 @@ static void DrawList(void)
         const char *s;
         if (viewIdx >= gViewCount)
             break;
-        t = &gTracks[gView[viewIdx]];
+        t = ViewTrack(viewIdx);
         s = t->albumArtist[0] ? t->albumArtist : t->artist;
         MoveTo(gColArtistX, (short)(LIST_TOP + i * ROW_HEIGHT + 12));
         DrawText((Ptr)s, 0, (short)strlen(s));
@@ -1131,7 +1614,7 @@ static void DrawList(void)
         const char *s;
         if (viewIdx >= gViewCount)
             break;
-        s = gTracks[gView[viewIdx]].album;
+        s = ViewTrack(viewIdx)->album;
         MoveTo(gColAlbumX, (short)(LIST_TOP + i * ROW_HEIGHT + 12));
         DrawText((Ptr)s, 0, (short)strlen(s));
     }
@@ -1177,10 +1660,10 @@ static void DrawFooter(void)
     area.bottom = r.bottom - 15;
     EraseRect(&area);
 
-    if (gPlayingIndex < 0 || !AudioIsPlaying())
+    if (!gHasPlayingTrack || !AudioIsPlaying())
         return;
 
-    t = &gTracks[gPlayingIndex];
+    t = &gPlayingTrack;
     elapsed = AudioPlaySeconds();
     if (elapsed < 0)
         elapsed = 0;
@@ -1226,7 +1709,7 @@ static void Draw(void)
     Rect hintClip;
     RGBColor black = { 0, 0, 0 };
     const char *hint =
-        "Up/Down select  Return play  / search  Tab sort  S stop  R reload  Q quit";
+        "Up/Down  Return play  / search  Tab sort  S stop  R reload  Cmd-, settings  Q quit";
 
     SetPort(gWin);
     r = gWin->portRect;
@@ -1257,6 +1740,612 @@ static void Draw(void)
     DrawTextAt(hint, 12, (short)(r.bottom - 5), &hintClip);
 
     DrawFooter();
+}
+
+/* ------------------------------------------------------------------ */
+/* Settings window                                                    */
+/* ------------------------------------------------------------------ */
+
+#define SETTINGS_WIDTH 480
+#define SETTINGS_HEIGHT 252
+
+#define SET_FOCUS_INSTANCE 0
+#define SET_FOCUS_USER 1
+#define SET_FOCUS_PASS 2
+#define SET_FOCUS_QUALITY 3
+
+static WindowPtr gSetWin;
+static char gSetInstance[96];
+static char gSetUser[48];
+static char gSetPass[64];
+static int gSetQuality;
+static int gSetFocus;
+static int gSetCaretOn = 1;
+static char gSetError[96];
+
+static short CStringWidth(const char *s)
+{
+    Str255 p;
+    long n = (long)strlen(s);
+
+    if (n > 255)
+        n = 255;
+    p[0] = (unsigned char)n;
+    memcpy(p + 1, s, n);
+    return StringWidth(p);
+}
+
+static Rect SettingsFieldRect(int index)
+{
+    Rect r = gSetWin->portRect;
+    Rect box;
+
+    box.left = 104;
+    box.right = r.right - 14;
+    box.top = (short)(16 + index * 26);
+    box.bottom = (short)(box.top + 18);
+    return box;
+}
+
+static Rect SettingsSaveRect(void)
+{
+    Rect r = gSetWin->portRect;
+    Rect box;
+
+    box.right = r.right - 108;
+    box.left = (short)(box.right - 80);
+    box.top = 220;
+    box.bottom = 240;
+    return box;
+}
+
+static Rect SettingsCancelRect(void)
+{
+    Rect r = gSetWin->portRect;
+    Rect box;
+
+    box.right = r.right - 16;
+    box.left = (short)(box.right - 80);
+    box.top = 220;
+    box.bottom = 240;
+    return box;
+}
+
+static Rect SettingsQualityRect(int index)
+{
+    Rect r = gSetWin->portRect;
+    Rect box;
+
+    box.left = 12;
+    box.right = r.right - 14;
+    box.top = (short)(112 + index * 22);
+    box.bottom = (short)(box.top + 20);
+    return box;
+}
+
+static char *SettingsFieldBuffer(int index, long *max)
+{
+    switch (index) {
+    case SET_FOCUS_INSTANCE:
+        *max = sizeof(gSetInstance);
+        return gSetInstance;
+    case SET_FOCUS_USER:
+        *max = sizeof(gSetUser);
+        return gSetUser;
+    case SET_FOCUS_PASS:
+        *max = sizeof(gSetPass);
+        return gSetPass;
+    default:
+        *max = 0;
+        return NULL;
+    }
+}
+
+static void DrawSettingsField(int index)
+{
+    Rect box = SettingsFieldRect(index);
+    Rect clip = box;
+    Rect focus;
+    const char *s = "";
+    char masked[64];
+    long i;
+    long len;
+
+    if (!gSetWin)
+        return;
+
+    SetPort(gSetWin);
+    TextFont(kFontIDGeneva);
+    TextSize(10);
+    TextFace(0);
+
+    EraseRect(&box);
+    FrameRect(&box);
+    if (gSetFocus == index) {
+        focus = box;
+        InsetRect(&focus, 1, 1);
+        FrameRect(&focus);
+    }
+
+    if (index == SET_FOCUS_PASS) {
+        len = (long)strlen(gSetPass);
+        if (len > (long)sizeof(masked) - 1)
+            len = (long)sizeof(masked) - 1;
+        for (i = 0; i < len; i++)
+            masked[i] = '*';
+        masked[len] = 0;
+        s = masked;
+    } else {
+        s = SettingsFieldBuffer(index, &len);
+        if (!s)
+            s = "";
+    }
+
+    InsetRect(&clip, 2, 2);
+    if (s[0])
+        DrawTextAt(s, (short)(box.left + 5), (short)(box.bottom - 5), &clip);
+
+    if (gSetFocus == index && gSetCaretOn) {
+        short caret = (short)(box.left + 5 + CStringWidth(s));
+        if (caret > box.right - 4)
+            caret = (short)(box.right - 4);
+        MoveTo(caret, (short)(box.top + 4));
+        LineTo(caret, (short)(box.bottom - 4));
+    }
+}
+
+static void DrawSettingsButtonText(const Rect *box, const char *label, int def)
+{
+    Rect inner;
+    short x;
+
+    EraseRect((Rect *)box);
+    FrameRect(box);
+    if (def) {
+        inner = *box;
+        InsetRect(&inner, 2, 2);
+        FrameRect(&inner);
+    }
+    x = (short)(box->left + (box->right - box->left - CStringWidth(label)) / 2);
+    MoveTo(x, (short)(box->bottom - 5));
+    DrawCString(label);
+}
+
+static void DrawSettingsWindow(void)
+{
+    Rect r;
+    Rect area;
+    Rect box;
+    Rect radio;
+    Rect dot;
+    char tmp[96];
+    int i;
+
+    if (!gSetWin)
+        return;
+
+    SetPort(gSetWin);
+    r = gSetWin->portRect;
+    EraseRect(&r);
+
+    TextFont(kFontIDGeneva);
+    TextSize(10);
+    TextFace(0);
+
+    MoveTo(12, 29);
+    DrawCString("Instance");
+    MoveTo(12, 55);
+    DrawCString("Username");
+    MoveTo(12, 81);
+    DrawCString("Password");
+
+    DrawSettingsField(SET_FOCUS_INSTANCE);
+    DrawSettingsField(SET_FOCUS_USER);
+    DrawSettingsField(SET_FOCUS_PASS);
+
+    MoveTo(12, 104);
+    DrawCString("Streaming quality");
+
+    for (i = 0; i < QUALITY_COUNT; i++) {
+        const QualityPreset *q = &gQualities[i];
+        Rect row = SettingsQualityRect(i);
+
+        if (i == gSetQuality) {
+            radio.left = 18;
+            radio.right = 28;
+            radio.top = (short)(row.top + 4);
+            radio.bottom = (short)(row.top + 14);
+            FrameOval(&radio);
+            dot = radio;
+            InsetRect(&dot, 3, 3);
+            PaintOval(&dot);
+        } else {
+            radio.left = 18;
+            radio.right = 28;
+            radio.top = (short)(row.top + 4);
+            radio.bottom = (short)(row.top + 14);
+            FrameOval(&radio);
+        }
+
+        if (q->rate == 44100)
+            snprintf(tmp, sizeof(tmp), "%s - 44.1 kHz %s", q->name,
+                     q->channels == 2 ? "stereo" : "mono");
+        else
+            snprintf(tmp, sizeof(tmp), "%s - %ld kHz %s", q->name,
+                     q->rate / 1000, q->channels == 2 ? "stereo" : "mono");
+        MoveTo(36, (short)(row.top + 14));
+        DrawCString(tmp);
+
+        snprintf(tmp, sizeof(tmp), "CPU: %s   Network: %s", q->cpu,
+                 q->network);
+        DrawRightCString(tmp, (short)(row.right - 2),
+                         (short)(row.top + 14));
+
+        if (gSetFocus == SET_FOCUS_QUALITY && i == gSetQuality) {
+            Rect focus = row;
+            InsetRect(&focus, 1, 1);
+            FrameRect(&focus);
+        }
+    }
+
+    MoveTo(12, 192);
+    DrawCString("Tab moves between fields - Up/Down chooses quality - Return saves - Esc cancels");
+
+    if (gSetError[0]) {
+        area.left = 12;
+        area.top = 196;
+        area.right = r.right - 14;
+        area.bottom = 212;
+        DrawTextAt(gSetError, 12, 208, &area);
+    }
+
+    box = SettingsSaveRect();
+    DrawSettingsButtonText(&box, "Save", 1);
+    box = SettingsCancelRect();
+    DrawSettingsButtonText(&box, "Cancel", 0);
+}
+
+static void CloseSettingsWindow(void)
+{
+    WindowPtr w = gSetWin;
+
+    gSetWin = NULL;
+    if (w)
+        DisposeWindow(w);
+    if (gWin) {
+        SelectWindow(gWin);
+        SetPort(gWin);
+    }
+}
+
+static void SaveSettings(void)
+{
+    char host[64];
+    char tmp[140];
+    int port;
+    int changed;
+
+    if (!ParseInstance(gSetInstance, host, sizeof(host), &port, gSetError,
+                       sizeof(gSetError))) {
+        DrawSettingsWindow();
+        return;
+    }
+    if (!gSetUser[0]) {
+        CopyField(gSetError, sizeof(gSetError), "Username cannot be empty");
+        DrawSettingsWindow();
+        return;
+    }
+    if (!WriteConfigFile(host, port, gSetUser, gSetPass, gSetQuality)) {
+        CopyField(gSetError, sizeof(gSetError),
+                  "Could not write the config file");
+        DrawSettingsWindow();
+        return;
+    }
+
+    changed = strcmp(host, gHost) != 0 || port != gPort ||
+              strcmp(gSetUser, gUser) != 0 || strcmp(gSetPass, gPass) != 0;
+    CopyField(gHost, sizeof(gHost), host);
+    gPort = port;
+    CopyField(gUser, sizeof(gUser), gSetUser);
+    CopyField(gPass, sizeof(gPass), gSetPass);
+    gQuality = gSetQuality;
+    CloseSettingsWindow();
+
+    if (changed) {
+        StopPlayback();
+        gBusy = 1;
+        gServerSearch = 0;
+        gSearchPending = 0;
+        gSearchCount = 0;
+        gToken[0] = 0;
+        gUserId[0] = 0;
+        if (Login() == 0)
+            FetchTracks();
+        gBusy = 0;
+    } else {
+        snprintf(tmp, sizeof(tmp), "Settings saved - %s quality",
+                 gQualities[gQuality].name);
+        SetStatus(tmp);
+    }
+    Draw();
+}
+
+static void SettingsClick(Point local)
+{
+    Rect box;
+    int i;
+
+    for (i = 0; i < 3; i++) {
+        box = SettingsFieldRect(i);
+        if (PtInRect(local, &box)) {
+            gSetFocus = i;
+            gSetCaretOn = 1;
+            DrawSettingsWindow();
+            return;
+        }
+    }
+    for (i = 0; i < QUALITY_COUNT; i++) {
+        box = SettingsQualityRect(i);
+        if (PtInRect(local, &box)) {
+            gSetQuality = i;
+            gSetFocus = SET_FOCUS_QUALITY;
+            DrawSettingsWindow();
+            return;
+        }
+    }
+    box = SettingsSaveRect();
+    if (PtInRect(local, &box)) {
+        SaveSettings();
+        return;
+    }
+    box = SettingsCancelRect();
+    if (PtInRect(local, &box)) {
+        CloseSettingsWindow();
+        return;
+    }
+}
+
+static void SettingsKey(long message)
+{
+    int code = (int)(message & charCodeMask);
+    int oldFocus = gSetFocus;
+    long max;
+    char *buf;
+
+    switch (code) {
+    case 0x1B: /* escape */
+        CloseSettingsWindow();
+        return;
+    case 0x0D:
+    case 0x03:
+        SaveSettings();
+        return;
+    case 0x09: /* tab */
+        gSetFocus = (gSetFocus + 1) % 4;
+        gSetCaretOn = 1;
+        DrawSettingsWindow();
+        return;
+    case 0x1E: /* up */
+        if (gSetFocus == SET_FOCUS_QUALITY && gSetQuality > 0) {
+            gSetQuality--;
+            DrawSettingsWindow();
+        }
+        return;
+    case 0x1F: /* down */
+        if (gSetFocus == SET_FOCUS_QUALITY &&
+            gSetQuality < QUALITY_COUNT - 1) {
+            gSetQuality++;
+            DrawSettingsWindow();
+        }
+        return;
+    case 0x08:
+    case 0x7F:
+        buf = SettingsFieldBuffer(gSetFocus, &max);
+        if (buf && buf[0]) {
+            buf[strlen(buf) - 1] = 0;
+            gSetCaretOn = 1;
+            DrawSettingsField(oldFocus);
+        }
+        return;
+    default:
+        break;
+    }
+
+    if (code >= 0x20 && code < 0x7F && gSetFocus < 3) {
+        long n;
+        buf = SettingsFieldBuffer(gSetFocus, &max);
+        n = (long)strlen(buf);
+        if (n < max - 1) {
+            buf[n] = (char)code;
+            buf[n + 1] = 0;
+            gSetCaretOn = 1;
+            DrawSettingsField(gSetFocus);
+        }
+    }
+}
+
+static void SettingsLoop(void)
+{
+    EventRecord ev;
+    unsigned long lastCaret = TickCount();
+
+    while (gSetWin) {
+        PlaybackTick();
+
+        if (TickCount() - lastCaret >= 20) {
+            lastCaret = TickCount();
+            if (gSetFocus < 3) {
+                gSetCaretOn = !gSetCaretOn;
+                DrawSettingsField(gSetFocus);
+            }
+        }
+
+        WaitNextEvent(everyEvent, &ev, 20, NULL);
+        switch (ev.what) {
+        case updateEvt:
+            if ((WindowPtr)ev.message == gSetWin) {
+                BeginUpdate(gSetWin);
+                DrawSettingsWindow();
+                EndUpdate(gSetWin);
+            }
+            break;
+        case keyDown:
+        case autoKey: {
+            long menu = 0;
+            if (ev.what == keyDown)
+                menu = MenuKey((short)(ev.message & charCodeMask));
+            if (menu)
+                HandleMenu(menu);
+            else
+                SettingsKey(ev.message);
+            break;
+        }
+        case mouseDown: {
+            WindowPtr clicked;
+            short part = FindWindow(ev.where, &clicked);
+            if (part == inMenuBar) {
+                HandleMenu(MenuSelect(ev.where));
+            } else if (clicked == gSetWin) {
+                if (part == inGoAway) {
+                    if (TrackGoAway(gSetWin, ev.where))
+                        CloseSettingsWindow();
+                } else if (part == inDrag) {
+                    DragWindow(gSetWin, ev.where, &qd.screenBits.bounds);
+                } else if (part == inContent) {
+                    Point local = ev.where;
+                    SetPort(gSetWin);
+                    GlobalToLocal(&local);
+                    SettingsClick(local);
+                }
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+}
+
+static void ShowSettings(void)
+{
+    Rect sb;
+    Rect bounds;
+    short width = SETTINGS_WIDTH;
+    short height = SETTINGS_HEIGHT;
+
+    if (gSetWin) {
+        SelectWindow(gSetWin);
+        return;
+    }
+
+    sb = qd.screenBits.bounds;
+    width = SETTINGS_WIDTH;
+    height = SETTINGS_HEIGHT;
+    if (width > sb.right - sb.left - 8)
+        width = (short)(sb.right - sb.left - 8);
+    if (height + 20 > sb.bottom - (sb.top + 22) - 4)
+        height = (short)(sb.bottom - (sb.top + 22) - 24);
+
+    bounds.left = (short)(sb.left + (sb.right - sb.left - width) / 2);
+    bounds.top = (short)(sb.top + 22 +
+                         (sb.bottom - (sb.top + 22) - (height + 20)) / 2 + 20);
+    bounds.right = (short)(bounds.left + width);
+    bounds.bottom = (short)(bounds.top + height);
+
+    snprintf(gSetInstance, sizeof(gSetInstance), "%s:%d", gHost, gPort);
+    CopyField(gSetUser, sizeof(gSetUser), gUser);
+    CopyField(gSetPass, sizeof(gSetPass), gPass);
+    gSetQuality = gQuality;
+    gSetFocus = SET_FOCUS_INSTANCE;
+    gSetCaretOn = 1;
+    gSetError[0] = 0;
+
+    gSetWin = NewWindow(NULL, &bounds, "\pSettings", true, documentProc,
+                        (WindowPtr)-1, false, 0);
+    if (!gSetWin)
+        return;
+
+    ShowWindow(gSetWin);
+    SelectWindow(gSetWin);
+    SetPort(gSetWin);
+    DrawSettingsWindow();
+    SettingsLoop();
+
+    if (gWin) {
+        SelectWindow(gWin);
+        SetPort(gWin);
+        Draw();
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Menus                                                              */
+/* ------------------------------------------------------------------ */
+
+#define MENU_APPLE 128
+#define MENU_FILE 129
+#define MENU_SETTINGS 130
+
+#define ITEM_APPLE_ABOUT 1
+#define ITEM_FILE_RELOAD 1
+#define ITEM_FILE_QUIT 3
+#define ITEM_SETTINGS_PREFS 1
+
+static void AppendMenuItemC(MenuHandle menu, const char *text)
+{
+    Str255 p;
+
+    MakePStr(text, p);
+    AppendMenu(menu, p);
+}
+
+static void SetupMenus(void)
+{
+    MenuHandle menu;
+
+    menu = NewMenu(MENU_APPLE, "\p\024");
+    AppendMenuItemC(menu, "About Jellyfin 68K...");
+    InsertMenu(menu, 0);
+
+    menu = NewMenu(MENU_FILE, "\pFile");
+    AppendMenuItemC(menu, "Reload Library/R");
+    AppendMenuItemC(menu, "-");
+    AppendMenuItemC(menu, "Quit/Q");
+    InsertMenu(menu, 0);
+
+    menu = NewMenu(MENU_SETTINGS, "\pSettings");
+    AppendMenuItemC(menu, "Preferences.../,");
+    InsertMenu(menu, 0);
+
+    DrawMenuBar();
+}
+
+static void HandleMenu(long result)
+{
+    short menuID = (short)(result >> 16);
+    short item = (short)(result & 0xFFFF);
+
+    HiliteMenu(0);
+    if (!menuID)
+        return;
+
+    if (menuID == MENU_APPLE) {
+        if (item == ITEM_APPLE_ABOUT) {
+            SetStatus("Jellyfin 68K " APP_VERSION
+                      " - Jellyfin music for classic 68K Macs");
+            DrawStatus();
+        }
+    } else if (menuID == MENU_FILE) {
+        if (item == ITEM_FILE_RELOAD) {
+            ReloadLibrary();
+        } else if (item == ITEM_FILE_QUIT) {
+            StopPlayback();
+            ExitToShell();
+        }
+    } else if (menuID == MENU_SETTINGS) {
+        if (item == ITEM_SETTINGS_PREFS && !gSetWin)
+            ShowSettings();
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1304,7 +2393,8 @@ static void AppendQuery(int c)
     if (n < (long)sizeof(gQuery) - 1) {
         gQuery[n] = (char)c;
         gQuery[n + 1] = 0;
-        RebuildView();
+        UseLocalSearch();
+        ScheduleServerSearch();
     }
 }
 
@@ -1313,7 +2403,12 @@ static void BackspaceQuery(void)
     long n = (long)strlen(gQuery);
     if (n > 0) {
         gQuery[n - 1] = 0;
-        RebuildView();
+        UseLocalSearch();
+        ScheduleServerSearch();
+        if (!gQuery[0]) {
+            SetStatus("Search cleared");
+            DrawStatus();
+        }
     }
 }
 
@@ -1326,7 +2421,10 @@ static void HandleKey(long message)
         case 0x1B: /* escape */
             gQuery[0] = 0;
             gSearchActive = 0;
-            RebuildView();
+            gSearchPending = 0;
+            UseLocalSearch();
+            SetStatus("Search cleared");
+            DrawStatus();
             RedrawFilter();
             return;
         case 0x08:
@@ -1361,7 +2459,7 @@ static void HandleKey(long message)
         case 0x0D:
         case 0x03:
             if (gViewCount > 0)
-                PlayTrack(gView[gSelected]);
+                PlayTrack(ViewTrack(gSelected));
             return;
         case 0x09:
             CycleSort();
@@ -1385,7 +2483,10 @@ static void HandleKey(long message)
     case 0x1B:
         if (gQuery[0]) {
             gQuery[0] = 0;
-            RebuildView();
+            gSearchPending = 0;
+            UseLocalSearch();
+            SetStatus("Search cleared");
+            DrawStatus();
         }
         gSearchActive = 0;
         RedrawFilter();
@@ -1418,7 +2519,7 @@ static void HandleKey(long message)
     case 0x03:
     case 0x20:
         if (gViewCount > 0)
-            PlayTrack(gView[gSelected]);
+            PlayTrack(ViewTrack(gSelected));
         break;
     case 0x09: /* tab */
         CycleSort();
@@ -1434,15 +2535,7 @@ static void HandleKey(long message)
         break;
     case 'r':
     case 'R':
-        if (!gBusy) {
-            gBusy = 1;
-            StopPlayback();
-            Login();
-            if (gToken[0])
-                FetchTracks();
-            gBusy = 0;
-            Draw();
-        }
+        ReloadLibrary();
         break;
     case 'q':
     case 'Q':
@@ -1490,7 +2583,7 @@ static void HandleContentClick(Point local)
                 DrawList();
             if (same && gLastClickRow == row &&
                 now - gLastClickTick <= 60) {
-                PlayTrack(gView[row]);
+                PlayTrack(ViewTrack(row));
                 gLastClickRow = -1;
             } else {
                 gLastClickRow = row;
@@ -1534,6 +2627,10 @@ int main(void)
     LogLine(gHost);
     LogLine("\r");
     LogNum("Config port: ", (long)gPort);
+    LogLine("Config quality: ");
+    LogLine(gQualities[gQuality].name);
+    LogLine("\r");
+    SetupMenus();
 
     /* NewWindow() treats the bounds as the content rectangle and adds the
      * title bar above it.  Reserve the menu bar, the title bar, and a small
@@ -1585,53 +2682,15 @@ int main(void)
     Draw();
 
     {
-        int wasPlaying = 0;
-        int wasSerial = gPlaybackSerial;
         int caretPhase = -1;
 
         for (;;) {
             int playing;
             long sleep;
 
-            /* Starting or stopping a track from a key or click resets the
-             * transition tracking, so a new track is never mistaken for the
-             * natural end of the previous one. */
-            if (gPlaybackSerial != wasSerial) {
-                wasSerial = gPlaybackSerial;
-                wasPlaying = 0;
-            }
-
-            PumpAudio();
+            PlaybackTick();
+            ServiceSearch();
             playing = AudioIsPlaying();
-
-            if (playing && !wasPlaying) {
-                if (gPlayingIndex >= 0) {
-                    char tmp[140];
-                    snprintf(tmp, sizeof(tmp), "Playing: %s", gNowPlaying);
-                    SetStatus(tmp);
-                    DrawStatus();
-                }
-                gLastFooterSecond = -1;
-                DrawFooter();
-            } else if (!playing && wasPlaying) {
-                if (gPlayingIndex >= 0) {
-                    char tmp[140];
-                    snprintf(tmp, sizeof(tmp), "Finished: %s", gNowPlaying);
-                    SetStatus(tmp);
-                    gPlayingIndex = -1;
-                    DrawStatus();
-                }
-                DrawFooter();
-            }
-            wasPlaying = playing;
-
-            if (playing) {
-                long sec = AudioPlaySeconds();
-                if (sec != gLastFooterSecond) {
-                    gLastFooterSecond = sec;
-                    DrawFooter();
-                }
-            }
 
             if (!playing && gSearchActive) {
                 int phase = (int)((TickCount() / 20) & 1);
@@ -1660,13 +2719,22 @@ int main(void)
                 }
                 break;
             case keyDown:
-            case autoKey:
-                HandleKey(ev.message);
+            case autoKey: {
+                long menu = 0;
+                if (ev.what == keyDown)
+                    menu = MenuKey((short)(ev.message & charCodeMask));
+                if (menu)
+                    HandleMenu(menu);
+                else
+                    HandleKey(ev.message);
                 break;
+            }
             case mouseDown: {
                 WindowPtr clicked;
                 short part = FindWindow(ev.where, &clicked);
-                if (part == inGoAway) {
+                if (part == inMenuBar) {
+                    HandleMenu(MenuSelect(ev.where));
+                } else if (part == inGoAway) {
                     if (TrackGoAway(gWin, ev.where)) {
                         StopPlayback();
                         return 0;
