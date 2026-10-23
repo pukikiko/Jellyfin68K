@@ -32,8 +32,8 @@ Tested against a live Jellyfin `10.11.11` server (`SWAGFLIX`) from System
   instant and a server-wide search finds matches beyond the loaded 400 tracks
 - Change the instance, username, password, and streaming quality from
   **Settings → Preferences...** (`Cmd-,`); changes are saved to the config file
-- Choose Low, Standard, or High quality; the Settings window shows the CPU,
-  network, and memory cost of each preset
+- Choose Low, Standard, or High quality; the Settings window shows the CPU
+  and network cost of each preset
 - Select, scroll, refresh, stop, and quit from the keyboard (or click rows)
 - Request a track with Jellyfin's `/Audio/{id}/universal` transcoder
 - Stream the chunked PCM response while it arrives and start playback after
@@ -178,7 +178,8 @@ match your server.
 
 Open **Settings → Preferences...** or press `Cmd-,`. The window edits the
 instance, username, and password, and lets you pick one of three quality
-presets. The CPU, network, and memory cost is shown next to each preset:
+presets. The CPU and network cost is shown next to each preset; the table
+also lists the PCM ring size:
 
 | Preset | Format | Network | CPU | PCM ring |
 | --- | --- | --- | --- | --- |
